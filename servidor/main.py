@@ -39,17 +39,12 @@ ALLOWED_ORIGINS = os.getenv(
     "http://localhost:3000,http://localhost:5173,http://localhost:8888"
 ).split(",")
 
-# URL base usada pela rota /generate.
-# Coloque seu domínio real no Render Environment.
-# Exemplo: PUBLIC_BASE_URL=https://seudominio.com
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://geradornpro.netlify.app/")
-
 MAX_GENERATE_AMOUNT = int(os.getenv("MAX_GENERATE_AMOUNT", "500"))
 
 
 app = FastAPI(
-    title="KNUZ Key API",
-    version="1.1.0"
+    title="zGuylheme Key API",
+    version="1.1.1"
 )
 
 
@@ -109,6 +104,7 @@ class GenerateBody(BaseModel):
 # =========================
 
 RATE_LIMIT_STORE = {}
+
 
 def get_client_ip(request: Request) -> str:
     forwarded = request.headers.get("x-forwarded-for")
@@ -194,6 +190,21 @@ def parse_iso(value: str) -> datetime:
 
 def normalize_key(key: str) -> str:
     return key.strip().upper()
+
+
+def normalize_service_type(service_type: str) -> str:
+    value = service_type.strip().lower()
+
+    aliases = {
+        "youtube": "yt",
+        "youTube": "yt",
+        "yt": "yt",
+        "canva": "canva",
+        "spotify": "spotify",
+        "deezer": "deezer",
+    }
+
+    return aliases.get(value, value)
 
 
 def generate_key() -> str:
@@ -343,24 +354,21 @@ def validate_key_data(key: str) -> dict:
 
 
 def build_generated_link(service_type: str, code: str) -> str:
-    """
-    Geração segura para seu próprio sistema.
-    Evita colocar lógica sensível no frontend.
-    """
+    service_type = normalize_service_type(service_type)
 
-    allowed_types = {
-        "canva": "canva",
-        "spotify": "spotify",
-        "deezer": "deezer",
-        "yt": "youtube"
-    }
+    if service_type == "canva":
+        return f"https://www.canva.com/pro/?utm_medium={code}"
 
-    if service_type not in allowed_types:
-        raise HTTPException(status_code=400, detail="Tipo inválido.")
+    if service_type == "spotify":
+        return f"https://www.spotify.com/br-pt/premium/?utm_medium={code}"
 
-    service_slug = allowed_types[service_type]
+    if service_type == "deezer":
+        return f"https://www.deezer.com/pt/offers/?utm_medium={code}"
 
-    return f"{PUBLIC_BASE_URL.rstrip('/')}/redeem/{service_slug}?code={code}"
+    if service_type == "yt":
+        return f"https://www.youtube.com/premium?utm_medium={code}"
+
+    raise HTTPException(status_code=400, detail="Tipo inválido.")
 
 
 # =========================
@@ -372,7 +380,7 @@ def home():
     return {
         "online": True,
         "message": "KNUZ Key API funcionando.",
-        "version": "1.1.0"
+        "version": "1.1.1"
     }
 
 
@@ -569,19 +577,20 @@ def generate_links(body: GenerateBody, request: Request):
             "message": validation.get("message", "Key inválida.")
         }
 
+    service_type = normalize_service_type(body.type)
     amount = min(body.amount, MAX_GENERATE_AMOUNT)
 
     results = []
 
     for _ in range(amount):
         code = generate_code(15)
-        link = build_generated_link(body.type, code)
+        link = build_generated_link(service_type, code)
         results.append(link)
 
     return {
         "success": True,
         "status": "generated",
-        "type": body.type,
+        "type": service_type,
         "amount": amount,
         "expires_at": validation.get("expires_at"),
         "results": results
