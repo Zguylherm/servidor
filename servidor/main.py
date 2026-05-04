@@ -4,13 +4,14 @@ import json
 import base64
 import sqlite3
 import secrets
+import time
 from pathlib import Path
 from hashlib import sha256
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -38,19 +39,43 @@ ALLOWED_ORIGINS = os.getenv(
     "http://localhost:3000,http://localhost:5173,http://localhost:8888"
 ).split(",")
 
+# URL base usada pela rota /generate.
+# Coloque seu domínio real no Render Environment.
+# Exemplo: PUBLIC_BASE_URL=https://seudominio.com
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://geradornpro.netlify.app/")
+
+MAX_GENERATE_AMOUNT = int(os.getenv("MAX_GENERATE_AMOUNT", "500"))
+
 
 app = FastAPI(
     title="KNUZ Key API",
-    version="1.0.0"
+    version="1.1.0"
 )
+
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[origin.strip() for origin in ALLOWED_ORIGINS if origin.strip()],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
+
+# =========================
+# SECURITY HEADERS
+# =========================
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+
+    return response
 
 
 # =========================
@@ -58,7 +83,7 @@ app.add_middleware(
 # =========================
 
 class LoginBody(BaseModel):
-    password: str = Field(min_length=1)
+    password: str = Field(min_length=1, max_length=200)
 
 
 class CreateKeyBody(BaseModel):
@@ -66,11 +91,52 @@ class CreateKeyBody(BaseModel):
 
 
 class KeyBody(BaseModel):
-    key: str = Field(min_length=5)
+    key: str = Field(min_length=5, max_length=80)
 
 
 class ValidateKeyBody(BaseModel):
-    key: str = Field(min_length=5)
+    key: str = Field(min_length=5, max_length=80)
+
+
+class GenerateBody(BaseModel):
+    key: str = Field(min_length=5, max_length=80)
+    type: str = Field(min_length=2, max_length=30)
+    amount: int = Field(ge=1, le=500)
+
+
+# =========================
+# RATE LIMIT SIMPLES
+# =========================
+
+RATE_LIMIT_STORE = {}
+
+def get_client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
+
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+
+    if request.client:
+        return request.client.host
+
+    return "unknown"
+
+
+def rate_limit(ip: str, action: str, limit: int, window_seconds: int):
+    now = time.time()
+    key = f"{ip}:{action}"
+
+    bucket = RATE_LIMIT_STORE.get(key, [])
+    bucket = [timestamp for timestamp in bucket if now - timestamp < window_seconds]
+
+    if len(bucket) >= limit:
+        raise HTTPException(
+            status_code=429,
+            detail="Muitas tentativas. Aguarde um pouco."
+        )
+
+    bucket.append(now)
+    RATE_LIMIT_STORE[key] = bucket
 
 
 # =========================
@@ -126,6 +192,10 @@ def parse_iso(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+def normalize_key(key: str) -> str:
+    return key.strip().upper()
+
+
 def generate_key() -> str:
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
@@ -133,6 +203,11 @@ def generate_key() -> str:
         return "".join(secrets.choice(alphabet) for _ in range(4))
 
     return f"KNUZ-{part()}-{part()}-{part()}"
+
+
+def generate_code(length: int = 15) -> str:
+    chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    return "".join(secrets.choice(chars) for _ in range(length))
 
 
 def create_token() -> str:
@@ -225,27 +300,99 @@ def get_key_from_db(key: str) -> Optional[sqlite3.Row]:
     conn = get_db()
     cur = conn.cursor()
 
-    cur.execute("SELECT * FROM keys WHERE key = ?", (key.strip(),))
+    cur.execute("SELECT * FROM keys WHERE key = ?", (normalize_key(key),))
     row = cur.fetchone()
 
     conn.close()
     return row
 
 
+def validate_key_data(key: str) -> dict:
+    row = get_key_from_db(key)
+
+    if not row:
+        return {
+            "valid": False,
+            "status": "invalid",
+            "message": "Key inválida."
+        }
+
+    item = row_to_key(row)
+
+    if item["offline"] or not item["active"]:
+        return {
+            "valid": False,
+            "status": "offline",
+            "message": "Key offline."
+        }
+
+    if item["expired"]:
+        return {
+            "valid": False,
+            "status": "expired",
+            "message": "Key expirada."
+        }
+
+    return {
+        "valid": True,
+        "status": "active",
+        "message": "Key válida.",
+        "key": item["key"],
+        "expires_at": item["expires_at"]
+    }
+
+
+def build_generated_link(service_type: str, code: str) -> str:
+    """
+    Geração segura para seu próprio sistema.
+    Evita colocar lógica sensível no frontend.
+    """
+
+    allowed_types = {
+        "canva": "canva",
+        "spotify": "spotify",
+        "deezer": "deezer",
+        "yt": "youtube"
+    }
+
+    if service_type not in allowed_types:
+        raise HTTPException(status_code=400, detail="Tipo inválido.")
+
+    service_slug = allowed_types[service_type]
+
+    return f"{PUBLIC_BASE_URL.rstrip('/')}/redeem/{service_slug}?code={code}"
+
+
 # =========================
-# ROTAS
+# ROTAS BASE
 # =========================
 
 @app.get("/")
 def home():
     return {
         "online": True,
-        "message": "KNUZ Key API funcionando."
+        "message": "KNUZ Key API funcionando.",
+        "version": "1.1.0"
     }
 
 
+@app.get("/health")
+def health():
+    return {
+        "ok": True,
+        "time": iso(now_utc())
+    }
+
+
+# =========================
+# ROTAS ADMIN
+# =========================
+
 @app.post("/admin/login")
-def admin_login(body: LoginBody):
+def admin_login(body: LoginBody, request: Request):
+    ip = get_client_ip(request)
+    rate_limit(ip, "admin_login", limit=8, window_seconds=300)
+
     password_ok = hmac.compare_digest(body.password, ADMIN_PASSWORD)
 
     if not password_ok:
@@ -324,10 +471,12 @@ def create_key(body: CreateKeyBody, _: bool = Depends(require_admin)):
 
 @app.post("/admin/keys/offline")
 def set_key_offline(body: KeyBody, _: bool = Depends(require_admin)):
+    key = normalize_key(body.key)
+
     conn = get_db()
     cur = conn.cursor()
 
-    cur.execute("SELECT * FROM keys WHERE key = ?", (body.key.strip(),))
+    cur.execute("SELECT * FROM keys WHERE key = ?", (key,))
     row = cur.fetchone()
 
     if not row:
@@ -342,7 +491,7 @@ def set_key_offline(body: KeyBody, _: bool = Depends(require_admin)):
         WHERE key = ?
     """, (
         iso(now_utc()),
-        body.key.strip()
+        key
     ))
 
     conn.commit()
@@ -356,10 +505,12 @@ def set_key_offline(body: KeyBody, _: bool = Depends(require_admin)):
 
 @app.post("/admin/keys/online")
 def set_key_online(body: KeyBody, _: bool = Depends(require_admin)):
+    key = normalize_key(body.key)
+
     conn = get_db()
     cur = conn.cursor()
 
-    cur.execute("SELECT * FROM keys WHERE key = ?", (body.key.strip(),))
+    cur.execute("SELECT * FROM keys WHERE key = ?", (key,))
     row = cur.fetchone()
 
     if not row:
@@ -380,7 +531,7 @@ def set_key_online(body: KeyBody, _: bool = Depends(require_admin)):
         WHERE key = ?
     """, (
         iso(now_utc()),
-        body.key.strip()
+        key
     ))
 
     conn.commit()
@@ -392,38 +543,46 @@ def set_key_online(body: KeyBody, _: bool = Depends(require_admin)):
     }
 
 
+# =========================
+# ROTAS DO SITE PRINCIPAL
+# =========================
+
 @app.post("/validate-key")
-def validate_key(body: ValidateKeyBody):
-    key = body.key.strip()
-    row = get_key_from_db(key)
+def validate_key(body: ValidateKeyBody, request: Request):
+    ip = get_client_ip(request)
+    rate_limit(ip, "validate_key", limit=60, window_seconds=300)
 
-    if not row:
+    return validate_key_data(body.key)
+
+
+@app.post("/generate")
+def generate_links(body: GenerateBody, request: Request):
+    ip = get_client_ip(request)
+    rate_limit(ip, "generate", limit=30, window_seconds=300)
+
+    validation = validate_key_data(body.key)
+
+    if not validation.get("valid"):
         return {
-            "valid": False,
-            "status": "invalid",
-            "message": "Key inválida."
+            "success": False,
+            "status": validation.get("status", "invalid"),
+            "message": validation.get("message", "Key inválida.")
         }
 
-    item = row_to_key(row)
+    amount = min(body.amount, MAX_GENERATE_AMOUNT)
 
-    if item["offline"] or not item["active"]:
-        return {
-            "valid": False,
-            "status": "offline",
-            "message": "Key offline."
-        }
+    results = []
 
-    if item["expired"]:
-        return {
-            "valid": False,
-            "status": "expired",
-            "message": "Key expirada."
-        }
+    for _ in range(amount):
+        code = generate_code(15)
+        link = build_generated_link(body.type, code)
+        results.append(link)
 
     return {
-        "valid": True,
-        "status": "active",
-        "message": "Key válida.",
-        "key": item["key"],
-        "expires_at": item["expires_at"]
+        "success": True,
+        "status": "generated",
+        "type": body.type,
+        "amount": amount,
+        "expires_at": validation.get("expires_at"),
+        "results": results
     }
