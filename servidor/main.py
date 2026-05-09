@@ -44,7 +44,7 @@ MAX_GENERATE_AMOUNT = int(os.getenv("MAX_GENERATE_AMOUNT", "500"))
 
 app = FastAPI(
     title="zGuylheme Key API",
-    version="1.1.1"
+    version="1.2.0"
 )
 
 
@@ -91,12 +91,14 @@ class KeyBody(BaseModel):
 
 class ValidateKeyBody(BaseModel):
     key: str = Field(min_length=5, max_length=80)
+    device_id: Optional[str] = Field(default=None, min_length=8, max_length=200)
 
 
 class GenerateBody(BaseModel):
     key: str = Field(min_length=5, max_length=80)
     type: str = Field(min_length=2, max_length=30)
     amount: int = Field(ge=1, le=500)
+    device_id: Optional[str] = Field(default=None, min_length=8, max_length=200)
 
 
 # =========================
@@ -159,9 +161,28 @@ def init_db():
             created_at TEXT NOT NULL,
             expires_at TEXT NOT NULL,
             offline_at TEXT,
-            online_at TEXT
+            online_at TEXT,
+            device_id TEXT,
+            bound_at TEXT,
+            last_ip TEXT,
+            last_user_agent TEXT
         )
     """)
+
+    # Migração segura para banco antigo
+    cur.execute("PRAGMA table_info(keys)")
+    existing_columns = {row["name"] for row in cur.fetchall()}
+
+    migrations = {
+        "device_id": "ALTER TABLE keys ADD COLUMN device_id TEXT",
+        "bound_at": "ALTER TABLE keys ADD COLUMN bound_at TEXT",
+        "last_ip": "ALTER TABLE keys ADD COLUMN last_ip TEXT",
+        "last_user_agent": "ALTER TABLE keys ADD COLUMN last_user_agent TEXT",
+    }
+
+    for column, sql in migrations.items():
+        if column not in existing_columns:
+            cur.execute(sql)
 
     conn.commit()
     conn.close()
@@ -192,16 +213,32 @@ def normalize_key(key: str) -> str:
     return key.strip().upper()
 
 
+def normalize_device_id(device_id: Optional[str], request: Request) -> str:
+    if device_id and device_id.strip():
+        return device_id.strip()
+
+    ip = get_client_ip(request)
+    user_agent = request.headers.get("user-agent", "unknown")
+    raw = f"{ip}:{user_agent}:{SECRET_KEY}"
+
+    return sha256(raw.encode()).hexdigest()
+
+
 def normalize_service_type(service_type: str) -> str:
     value = service_type.strip().lower()
 
     aliases = {
         "youtube": "yt",
-        "youTube": "yt",
         "yt": "yt",
         "canva": "canva",
         "spotify": "spotify",
         "deezer": "deezer",
+        "prime": "primevideo",
+        "primevideo": "primevideo",
+        "prime video": "primevideo",
+        "prime-video": "primevideo",
+        "amazonprime": "primevideo",
+        "amazon prime": "primevideo",
     }
 
     return aliases.get(value, value)
@@ -292,6 +329,7 @@ def require_admin(authorization: Optional[str] = Header(default=None)):
 def row_to_key(row: sqlite3.Row) -> dict:
     expires_at = parse_iso(row["expires_at"])
     expired = now_utc() > expires_at
+    columns = row.keys()
 
     return {
         "id": row["id"],
@@ -304,6 +342,12 @@ def row_to_key(row: sqlite3.Row) -> dict:
         "expires_at": row["expires_at"],
         "offline_at": row["offline_at"],
         "online_at": row["online_at"],
+
+        # Dados da trava por dispositivo
+        "device_locked": bool(row["device_id"]) if "device_id" in columns else False,
+        "bound_at": row["bound_at"] if "bound_at" in columns else None,
+        "last_ip": row["last_ip"] if "last_ip" in columns else None,
+        "last_user_agent": row["last_user_agent"] if "last_user_agent" in columns else None,
     }
 
 
@@ -318,7 +362,7 @@ def get_key_from_db(key: str) -> Optional[sqlite3.Row]:
     return row
 
 
-def validate_key_data(key: str) -> dict:
+def validate_key_basic(key: str) -> dict:
     row = get_key_from_db(key)
 
     if not row:
@@ -353,6 +397,106 @@ def validate_key_data(key: str) -> dict:
     }
 
 
+def bind_or_validate_device(key: str, device_id: str, request: Request) -> dict:
+    normalized_key = normalize_key(key)
+    ip = get_client_ip(request)
+    user_agent = request.headers.get("user-agent", "unknown")
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT * FROM keys WHERE key = ?", (normalized_key,))
+    row = cur.fetchone()
+
+    if not row:
+        conn.close()
+        return {
+            "valid": False,
+            "status": "invalid",
+            "message": "Key inválida."
+        }
+
+    item = row_to_key(row)
+
+    if item["offline"] or not item["active"]:
+        conn.close()
+        return {
+            "valid": False,
+            "status": "offline",
+            "message": "Key offline."
+        }
+
+    if item["expired"]:
+        conn.close()
+        return {
+            "valid": False,
+            "status": "expired",
+            "message": "Key expirada."
+        }
+
+    saved_device_id = row["device_id"] if "device_id" in row.keys() else None
+
+    # Primeira pessoa/dispositivo que usar a key fica dono dela
+    if not saved_device_id:
+        cur.execute("""
+            UPDATE keys
+            SET device_id = ?,
+                bound_at = ?,
+                last_ip = ?,
+                last_user_agent = ?
+            WHERE key = ?
+        """, (
+            device_id,
+            iso(now_utc()),
+            ip,
+            user_agent,
+            normalized_key
+        ))
+
+        conn.commit()
+        conn.close()
+
+        return {
+            "valid": True,
+            "status": "active",
+            "message": "Key válida e vinculada a este dispositivo.",
+            "key": item["key"],
+            "expires_at": item["expires_at"]
+        }
+
+    # Se outra pessoa tentar usar a mesma key, bloqueia
+    if saved_device_id != device_id:
+        conn.close()
+        return {
+            "valid": False,
+            "status": "device_blocked",
+            "message": "Essa key já está vinculada a outro dispositivo."
+        }
+
+    # Mesmo dispositivo: atualiza último acesso
+    cur.execute("""
+        UPDATE keys
+        SET last_ip = ?,
+            last_user_agent = ?
+        WHERE key = ?
+    """, (
+        ip,
+        user_agent,
+        normalized_key
+    ))
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "valid": True,
+        "status": "active",
+        "message": "Key válida.",
+        "key": item["key"],
+        "expires_at": item["expires_at"]
+    }
+
+
 def build_generated_link(service_type: str, code: str) -> str:
     service_type = normalize_service_type(service_type)
 
@@ -368,6 +512,9 @@ def build_generated_link(service_type: str, code: str) -> str:
     if service_type == "yt":
         return f"https://www.youtube.com/premium?utm_medium={code}"
 
+    if service_type == "primevideo":
+        return f"https://www.primevideo.com/offers/nonprimehomepage/ref=dv_web_force_root?utm_medium={code}"
+
     raise HTTPException(status_code=400, detail="Tipo inválido.")
 
 
@@ -380,7 +527,7 @@ def home():
     return {
         "online": True,
         "message": "KNUZ Key API funcionando.",
-        "version": "1.1.1"
+        "version": "1.2.0"
     }
 
 
@@ -448,9 +595,13 @@ def create_key(body: CreateKeyBody, _: bool = Depends(require_admin)):
                     active,
                     offline,
                     created_at,
-                    expires_at
+                    expires_at,
+                    device_id,
+                    bound_at,
+                    last_ip,
+                    last_user_agent
                 )
-                VALUES (?, ?, 1, 0, ?, ?)
+                VALUES (?, ?, 1, 0, ?, ?, NULL, NULL, NULL, NULL)
             """, (
                 key,
                 body.duration_days,
@@ -466,6 +617,7 @@ def create_key(body: CreateKeyBody, _: bool = Depends(require_admin)):
                 "duration_days": body.duration_days,
                 "active": True,
                 "offline": False,
+                "device_locked": False,
                 "created_at": iso(created_at),
                 "expires_at": iso(expires_at)
             }
@@ -551,6 +703,40 @@ def set_key_online(body: KeyBody, _: bool = Depends(require_admin)):
     }
 
 
+@app.post("/admin/keys/reset-device")
+def reset_key_device(body: KeyBody, _: bool = Depends(require_admin)):
+    key = normalize_key(body.key)
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT * FROM keys WHERE key = ?", (key,))
+    row = cur.fetchone()
+
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Key não encontrada.")
+
+    cur.execute("""
+        UPDATE keys
+        SET device_id = NULL,
+            bound_at = NULL,
+            last_ip = NULL,
+            last_user_agent = NULL
+        WHERE key = ?
+    """, (
+        key,
+    ))
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "success": True,
+        "message": "Dispositivo da key resetado. A próxima pessoa que usar vai vincular novamente."
+    }
+
+
 # =========================
 # ROTAS DO SITE PRINCIPAL
 # =========================
@@ -560,7 +746,9 @@ def validate_key(body: ValidateKeyBody, request: Request):
     ip = get_client_ip(request)
     rate_limit(ip, "validate_key", limit=60, window_seconds=300)
 
-    return validate_key_data(body.key)
+    device_id = normalize_device_id(body.device_id, request)
+
+    return bind_or_validate_device(body.key, device_id, request)
 
 
 @app.post("/generate")
@@ -568,7 +756,8 @@ def generate_links(body: GenerateBody, request: Request):
     ip = get_client_ip(request)
     rate_limit(ip, "generate", limit=30, window_seconds=300)
 
-    validation = validate_key_data(body.key)
+    device_id = normalize_device_id(body.device_id, request)
+    validation = bind_or_validate_device(body.key, device_id, request)
 
     if not validation.get("valid"):
         return {
@@ -595,3 +784,17 @@ def generate_links(body: GenerateBody, request: Request):
         "expires_at": validation.get("expires_at"),
         "results": results
     }
+
+
+# =========================
+# ROTAS COM /api
+# =========================
+
+@app.post("/api/validate-key")
+def api_validate_key(body: ValidateKeyBody, request: Request):
+    return validate_key(body, request)
+
+
+@app.post("/api/generate")
+def api_generate_links(body: GenerateBody, request: Request):
+    return generate_links(body, request)
