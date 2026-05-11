@@ -36,7 +36,7 @@ TOKEN_MINUTES = int(os.getenv("TOKEN_MINUTES", "1440"))
 
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS",
-    "http://localhost:3000,http://localhost:5173,http://localhost:8888"
+    "https://veltrix.space,https://painel.veltrix.space,http://localhost:3000,http://localhost:5173,http://localhost:8888"
 ).split(",")
 
 MAX_GENERATE_AMOUNT = int(os.getenv("MAX_GENERATE_AMOUNT", "500"))
@@ -44,7 +44,7 @@ MAX_GENERATE_AMOUNT = int(os.getenv("MAX_GENERATE_AMOUNT", "500"))
 
 app = FastAPI(
     title="zGuylheme Key API",
-    version="1.2.0"
+    version="1.2.1"
 )
 
 
@@ -169,7 +169,6 @@ def init_db():
         )
     """)
 
-    # Migração segura para banco antigo
     cur.execute("PRAGMA table_info(keys)")
     existing_columns = {row["name"] for row in cur.fetchall()}
 
@@ -342,8 +341,6 @@ def row_to_key(row: sqlite3.Row) -> dict:
         "expires_at": row["expires_at"],
         "offline_at": row["offline_at"],
         "online_at": row["online_at"],
-
-        # Dados da trava por dispositivo
         "device_locked": bool(row["device_id"]) if "device_id" in columns else False,
         "bound_at": row["bound_at"] if "bound_at" in columns else None,
         "last_ip": row["last_ip"] if "last_ip" in columns else None,
@@ -360,41 +357,6 @@ def get_key_from_db(key: str) -> Optional[sqlite3.Row]:
 
     conn.close()
     return row
-
-
-def validate_key_basic(key: str) -> dict:
-    row = get_key_from_db(key)
-
-    if not row:
-        return {
-            "valid": False,
-            "status": "invalid",
-            "message": "Key inválida."
-        }
-
-    item = row_to_key(row)
-
-    if item["offline"] or not item["active"]:
-        return {
-            "valid": False,
-            "status": "offline",
-            "message": "Key offline."
-        }
-
-    if item["expired"]:
-        return {
-            "valid": False,
-            "status": "expired",
-            "message": "Key expirada."
-        }
-
-    return {
-        "valid": True,
-        "status": "active",
-        "message": "Key válida.",
-        "key": item["key"],
-        "expires_at": item["expires_at"]
-    }
 
 
 def bind_or_validate_device(key: str, device_id: str, request: Request) -> dict:
@@ -436,7 +398,6 @@ def bind_or_validate_device(key: str, device_id: str, request: Request) -> dict:
 
     saved_device_id = row["device_id"] if "device_id" in row.keys() else None
 
-    # Primeira pessoa/dispositivo que usar a key fica dono dela
     if not saved_device_id:
         cur.execute("""
             UPDATE keys
@@ -464,7 +425,6 @@ def bind_or_validate_device(key: str, device_id: str, request: Request) -> dict:
             "expires_at": item["expires_at"]
         }
 
-    # Se outra pessoa tentar usar a mesma key, bloqueia
     if saved_device_id != device_id:
         conn.close()
         return {
@@ -473,7 +433,6 @@ def bind_or_validate_device(key: str, device_id: str, request: Request) -> dict:
             "message": "Essa key já está vinculada a outro dispositivo."
         }
 
-    # Mesmo dispositivo: atualiza último acesso
     cur.execute("""
         UPDATE keys
         SET last_ip = ?,
@@ -527,7 +486,7 @@ def home():
     return {
         "online": True,
         "message": "KNUZ Key API funcionando.",
-        "version": "1.2.0"
+        "version": "1.2.1"
     }
 
 
@@ -537,6 +496,16 @@ def health():
         "ok": True,
         "time": iso(now_utc())
     }
+
+
+@app.get("/api")
+def api_home():
+    return home()
+
+
+@app.get("/api/health")
+def api_health():
+    return health()
 
 
 # =========================
@@ -798,3 +767,37 @@ def api_validate_key(body: ValidateKeyBody, request: Request):
 @app.post("/api/generate")
 def api_generate_links(body: GenerateBody, request: Request):
     return generate_links(body, request)
+
+
+# =========================
+# ROTAS ADMIN COM /api
+# =========================
+
+@app.post("/api/admin/login")
+def api_admin_login(body: LoginBody, request: Request):
+    return admin_login(body, request)
+
+
+@app.get("/api/admin/keys")
+def api_list_keys(_: bool = Depends(require_admin)):
+    return list_keys(_)
+
+
+@app.post("/api/admin/keys/create")
+def api_create_key(body: CreateKeyBody, _: bool = Depends(require_admin)):
+    return create_key(body, _)
+
+
+@app.post("/api/admin/keys/offline")
+def api_set_key_offline(body: KeyBody, _: bool = Depends(require_admin)):
+    return set_key_offline(body, _)
+
+
+@app.post("/api/admin/keys/online")
+def api_set_key_online(body: KeyBody, _: bool = Depends(require_admin)):
+    return set_key_online(body, _)
+
+
+@app.post("/api/admin/keys/reset-device")
+def api_reset_key_device(body: KeyBody, _: bool = Depends(require_admin)):
+    return reset_key_device(body, _)
